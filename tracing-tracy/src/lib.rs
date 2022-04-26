@@ -33,17 +33,19 @@
 //!
 //! # Important note
 //!
-//! Unlike with many other subscriber implementations, simply depending on this crate is sufficient
-//! for tracy to be enabled at program startup, even if [`TracyLayer`](TracyLayer) is not
-//! registered as a subscriber. While not registering a `TracyLayer` will avoid Tracy from
-//! collecting spans, it still broadcasts discovery packets to the local network and exposes the
-//! data it collects in the background to that same network. Traces collected by Tracy may include
-//! source and assembly code as well.
+//! Depending on the configuration Tracy may broadcast discovery packets to the local network and
+//! expose the data it collects in the background to that same network. Traces collected by Tracy
+//! may include source and assembly code as well.
 //!
 //! As thus, you may want make sure to only enable the `tracing-tracy` crate conditionally, via the
 //! `enable` feature flag provided by this crate.
 //!
 //! [Tracy]: https://github.com/wolfpld/tracy
+//!
+//! # Features
+//!
+//! Refer to the [`client::sys`] crate for documentation on crate features. This crate re-exports
+//! all the features from [`client`].
 
 use std::{borrow::Cow, cell::RefCell, collections::VecDeque, fmt::Write};
 use tracing_core::{
@@ -58,7 +60,9 @@ use tracing_subscriber::{
     registry,
 };
 
-use tracy_client::{color_message, finish_continuous_frame, message, Span};
+use client::{color_message, finish_continuous_frame, message, Span};
+
+pub use client;
 
 thread_local! {
     /// A stack of spans currently active on the current thread.
@@ -78,6 +82,7 @@ impl TracyLayer<DefaultFields> {
     ///
     /// Defaults to collecting stack traces.
     pub fn new() -> Self {
+        client::enable();
         Self {
             fmt: DefaultFields::default(),
             stack_depth: 64,
@@ -239,6 +244,12 @@ where
         if visitor.frame_mark {
             finish_continuous_frame!();
         }
+    }
+}
+
+impl<F> Drop for TracyLayer<F> {
+    fn drop(&mut self) {
+        client::disable();
     }
 }
 

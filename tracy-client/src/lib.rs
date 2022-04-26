@@ -1,23 +1,148 @@
 //! This crate is a set of safe bindings to the client library of the [Tracy profiler].
 //!
-//! If you have already instrumented your application with `tracing`, consider `tracing-tracy`.
+//! If you have already instrumented your application with `tracing`, consider the `tracing-tracy`
+//! crate.
+//!
+//! [Tracy profiler]: https://github.com/wolfpld/tracy
 //!
 //! # Important note
 //!
-//! Simply depending on this crate is sufficient for tracy to be enabled at program startup, even
-//! if none of the APIs provided by this crate are invoked. Tracy will broadcast discovery packets
-//! to the local network and expose the data it collects in the background to that same network.
-//! Traces collected by Tracy may include source and assembly code as well.
+//! Depending on the configuration Tracy may broadcast discovery packets to the local network and
+//! expose the data it collects in the background to that same network. Traces collected by Tracy
+//! may include source and assembly code as well.
 //!
-//! As thus, you may want make sure to only enable the `tracy-client` crate conditionally, via the
-//! `enable` feature flag provided by this crate.
+//! As thus, you may want make sure to only enable the `tracy-client` crate conditionally, via
+//! the `enable` feature flag provided by this crate.
 //!
-//! [Tracy profiler]: https://github.com/wolfpld/tracy
-#![cfg_attr(not(feature="enable"), allow(unused_imports, unused_variables))]
+//! In order to start tracing it is important that you first call the [`enable`] function first to
+//! initialize the client. The [`disable`] must not be called until it is guaranteed that there
+//! will be no more calls to any other APIs. This can be especially difficult to ensure if you have
+//! detached threads. It is valid to never call `disable` at all.
+//!
+//! # Features
+//!
+//! Refer to the [`sys`] crate for documentation on crate features. This crate re-exports all the
+//! features from [`sys`].
+#![cfg_attr(not(feature = "enable"), allow(unused_imports, unused_variables))]
 
 use std::alloc;
 use std::ffi::CString;
-use tracy_client_sys as sys;
+use std::sync::atomic::{AtomicUsize, Ordering};
+pub use sys;
+
+/// When enabling `Tracy` when it is already enabled, or when disabling when it is already disabled
+/// can cause applications to crash. I personally think it would be better if this was a sort-of
+/// reference counted kind-of thing so you could enable as many times as you wish and disable just
+/// as many times without any reprecursions. At the very least this could significantly help tests.
+///
+/// In order to do this we want to track 4 states that construct a following finite state machine
+///
+/// ```text
+///     0 = disabled  -----> 1 = enabling
+///         ^                    v
+///     3 = disabling <----- 2 = enabled
+/// ```
+///
+/// And also include a reference count somewhere in there. Something we can throw in a static would
+/// be ideal.
+///
+/// Sadly, I am not aware of any libraries which would make this easier, so rolling out our own
+/// things it is then!
+///
+/// Oh and it'll definitely involve spinning, getting some vertigo medication is advised.
+///
+/// ---
+///
+/// We will use a single Atomic to store this information. The 2 top-most bits will represent the
+/// state bits and the rest will act as a counter.
+#[cfg(feature = "enable")]
+static ENABLE_STATE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "enable")]
+const REFCOUNT_MASK: usize = usize::max_value() >> 2;
+#[cfg(feature = "enable")]
+const STATE_STEP: usize = REFCOUNT_MASK + 1; // Move forward by 1 step in the FSM
+#[cfg(feature = "enable")]
+const STATE_DISABLED: usize = 0;
+#[cfg(feature = "enable")]
+const STATE_ENABLING: usize = STATE_DISABLED + STATE_STEP;
+#[cfg(feature = "enable")]
+const STATE_ENABLED: usize = STATE_ENABLING + STATE_STEP;
+#[cfg(feature = "enable")]
+const STATE_DISABLING: usize = STATE_ENABLED + STATE_STEP;
+#[cfg(feature = "enable")]
+const STATE_MASK: usize = STATE_DISABLING;
+
+pub fn enable() {
+    #[cfg(feature = "enable")]
+    {
+        // We don't particularly care about efficiency here, so we’ll be using CAS loops and
+        // orderings that aren't necessarily the fastest possible in this instance.
+        let old_state = loop {
+            let result = ENABLE_STATE.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+                // Here we want to increment the reference count, and also apply the tansition from
+                // state 0 (disabled) to state 1 (enabling), if possible.
+                match state & STATE_MASK {
+                    STATE_DISABLED => Some(state + STATE_ENABLING + 1),
+                    STATE_ENABLED => Some(state + 1),
+                    STATE_ENABLING => Some(state + 1),
+                    // Wait for the ongoing disable to complete.
+                    STATE_DISABLING => None,
+                    _ => unreachable!(),
+                }
+            });
+            if let Ok(result) = result {
+                break result;
+            }
+        };
+        match old_state & STATE_MASK {
+            STATE_DISABLED => {
+                unsafe {
+                    // SAFETY: no known soundness invariants.
+                    sys::___tracy_startup_profiler();
+                }
+                ENABLE_STATE.fetch_add(STATE_STEP, Ordering::SeqCst);
+            }
+            STATE_ENABLING => {
+                // wait for the profiler to reach the enabled state
+                while ENABLE_STATE.load(Ordering::SeqCst) & STATE_MASK != STATE_ENABLED {}
+            }
+            STATE_ENABLED => return,
+            _ => unreachable!(),
+        }
+    }
+}
+
+pub fn disable() {
+    #[cfg(feature = "enable")]
+    {
+        let old_state = loop {
+            let result = ENABLE_STATE.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+                match state & STATE_MASK {
+                    STATE_DISABLED => Some(state), // no change
+                    // last reference, go to the disabling state
+                    STATE_ENABLED if state & REFCOUNT_MASK == 1 => Some(STATE_DISABLING),
+                    STATE_ENABLED => Some(state - 1),
+                    // Wait for an ongoing enable or disable complete.
+                    STATE_ENABLING | STATE_DISABLING => None,
+                    _ => unreachable!(),
+                }
+            });
+            if let Ok(result) = result {
+                break result;
+            }
+        };
+        match old_state & STATE_MASK {
+            STATE_ENABLED if old_state & REFCOUNT_MASK == 1 => {
+                unsafe {
+                    dbg!(sys::___tracy_shutdown_profiler());
+                }
+                ENABLE_STATE.fetch_and(REFCOUNT_MASK, Ordering::SeqCst);
+            }
+            STATE_DISABLED | STATE_ENABLED => {}
+            STATE_ENABLING | STATE_DISABLING | _ => unreachable!(),
+        }
+    }
+}
 
 /// Start a new Tracy span with function, file, and line determined automatically.
 ///
@@ -26,7 +151,10 @@ use tracy_client_sys as sys;
 /// Begin a span region, which will be terminated once `_span` goes out of scope:
 ///
 /// ```
+/// # tracy_client::enable();
 /// let _span = tracy_client::span!("some span");
+/// # drop(_span);
+/// # tracy_client::disable();
 /// ```
 #[macro_export]
 macro_rules! span {
@@ -51,7 +179,7 @@ macro_rules! span_impl {
             let function_name = std::any::type_name::<S>();
             let function_name = CString::new(&function_name[..function_name.len() - 3]).unwrap();
             $crate::internal::SrcLoc {
-                data: $crate::internal::sys::___tracy_source_location_data {
+                data: $crate::sys::___tracy_source_location_data {
                     name: concat!($name, "\0").as_ptr().cast(),
                     function: function_name.as_ptr(),
                     file: concat!(file!(), "\0").as_ptr().cast(),
@@ -80,7 +208,6 @@ pub mod internal {
     use std::ffi::CString;
 
     pub use once_cell;
-    pub use tracy_client_sys as sys;
 
     pub struct SrcLoc {
         pub _function_name: CString,
@@ -92,13 +219,13 @@ pub mod internal {
 }
 
 /// A handle representing a span of execution.
-#[cfg(feature="enable")]
+#[cfg(feature = "enable")]
 pub struct Span(
     sys::___tracy_c_zone_context,
     std::marker::PhantomData<*mut sys::___tracy_c_zone_context>,
 );
 
-#[cfg(not(feature="enable"))]
+#[cfg(not(feature = "enable"))]
 pub struct Span(());
 
 impl Span {
@@ -109,11 +236,11 @@ impl Span {
     ///
     /// `callstack_depth` specifies the maximum number of stack frames client should collect.
     pub fn new(name: &str, function: &str, file: &str, line: u32, callstack_depth: u16) -> Self {
-        #[cfg(not(feature="enable"))]
+        #[cfg(not(feature = "enable"))]
         {
             return Self(());
         }
-        #[cfg(feature="enable")]
+        #[cfg(feature = "enable")]
         unsafe {
             let loc = sys::___tracy_alloc_srcloc_name(
                 line,
@@ -176,7 +303,7 @@ impl Span {
     /// Emit a numeric value associated with this span.
     pub fn emit_value(&self, value: u64) {
         // SAFE: the only way to construct `Span` is by creating a valid tracy zone context.
-        #[cfg(feature="enable")]
+        #[cfg(feature = "enable")]
         unsafe {
             sys::___tracy_emit_zone_value(self.0, value);
         }
@@ -185,7 +312,7 @@ impl Span {
     /// Emit some text associated with this span.
     pub fn emit_text(&self, text: &str) {
         // SAFE: the only way to construct `Span` is by creating a valid tracy zone context.
-        #[cfg(feature="enable")]
+        #[cfg(feature = "enable")]
         unsafe {
             sys::___tracy_emit_zone_text(self.0, text.as_ptr() as _, text.len());
         }
@@ -194,7 +321,7 @@ impl Span {
     /// Emit a color associated with this span.
     pub fn emit_color(&self, color: u32) {
         // SAFE: the only way to construct `Span` is by creating a valid tracy zone context.
-        #[cfg(feature="enable")]
+        #[cfg(feature = "enable")]
         unsafe {
             sys::___tracy_emit_zone_color(self.0, color);
         }
@@ -204,7 +331,7 @@ impl Span {
 impl Drop for Span {
     fn drop(&mut self) {
         // SAFE: the only way to construct `Span` is by creating a valid tracy zone context.
-        #[cfg(feature="enable")]
+        #[cfg(feature = "enable")]
         unsafe {
             sys::___tracy_emit_zone_end(self.0);
         }
@@ -214,6 +341,9 @@ impl Drop for Span {
 /// A profiling wrapper around an allocator.
 ///
 /// See documentation for [`std::alloc`](std::alloc) for more information about global allocators.
+///
+/// Note that for this to work correctly, all allocations freed while the client is enabled must
+/// have a corresponding allocation in the same client instance.
 ///
 /// # Examples
 ///
@@ -233,24 +363,24 @@ impl<T> ProfiledAllocator<T> {
     }
 
     fn emit_alloc(&self, ptr: *mut u8, size: usize) -> *mut u8 {
-        #[cfg(feature="enable")]
+        #[cfg(feature = "enable")]
         unsafe {
             if self.1 == 0 {
-                sys::___tracy_emit_memory_alloc(ptr as _, size, 1);
+                sys::___tracy_emit_memory_alloc(ptr.cast(), size, 1);
             } else {
-                sys::___tracy_emit_memory_alloc_callstack(ptr as _, size, self.1.into(), 1);
+                sys::___tracy_emit_memory_alloc_callstack(ptr.cast(), size, self.1.into(), 1);
             }
         }
         ptr
     }
 
     fn emit_free(&self, ptr: *mut u8) -> *mut u8 {
-        #[cfg(feature="enable")]
+        #[cfg(feature = "enable")]
         unsafe {
             if self.1 == 0 {
-                sys::___tracy_emit_memory_free(ptr as _, 1);
+                sys::___tracy_emit_memory_free(ptr.cast(), 1);
             } else {
-                sys::___tracy_emit_memory_free_callstack(ptr as _, self.1.into(), 1);
+                sys::___tracy_emit_memory_free_callstack(ptr.cast(), self.1.into(), 1);
             }
         }
         ptr
@@ -315,7 +445,7 @@ macro_rules! finish_continuous_frame {
 /// `name` must contain a NULL byte.
 #[doc(hidden)]
 pub unsafe fn finish_continuous_frame(name: *const u8) {
-    #[cfg(feature="enable")]
+    #[cfg(feature = "enable")]
     {
         sys::___tracy_emit_frame_mark(name as _);
     }
@@ -325,9 +455,7 @@ pub unsafe fn finish_continuous_frame(name: *const u8) {
 #[macro_export]
 macro_rules! start_noncontinuous_frame {
     ($name: literal) => {
-        unsafe {
-            $crate::Frame::start_noncontinuous_frame(concat!($name, "\0"))
-        }
+        unsafe { $crate::Frame::start_noncontinuous_frame(concat!($name, "\0")) }
     };
 }
 
@@ -342,7 +470,7 @@ impl Frame {
     /// `name` must contain a NULL byte.
     #[doc(hidden)]
     pub unsafe fn start_noncontinuous_frame(name: &'static str) -> Frame {
-        #[cfg(feature="enable")]
+        #[cfg(feature = "enable")]
         {
             sys::___tracy_emit_frame_mark_start(name.as_ptr() as _);
         }
@@ -352,7 +480,7 @@ impl Frame {
 
 impl Drop for Frame {
     fn drop(&mut self) {
-        #[cfg(feature="enable")]
+        #[cfg(feature = "enable")]
         unsafe {
             sys::___tracy_emit_frame_mark_end(self.0.as_ptr() as _);
         }
@@ -363,7 +491,7 @@ impl Drop for Frame {
 ///
 /// `callstack_depth` specifies the maximum number of stack frames client should collect.
 pub fn message(message: &str, callstack_depth: u16) {
-    #[cfg(feature="enable")]
+    #[cfg(feature = "enable")]
     unsafe {
         sys::___tracy_emit_message(
             message.as_ptr() as _,
@@ -380,7 +508,7 @@ pub fn message(message: &str, callstack_depth: u16) {
 /// The colour shall be provided as RGBA, where the least significant 8 bits represent the alpha
 /// component and most significant 8 bits represent the red component.
 pub fn color_message(message: &str, rgba: u32, callstack_depth: u16) {
-    #[cfg(feature="enable")]
+    #[cfg(feature = "enable")]
     unsafe {
         sys::___tracy_emit_messageC(
             message.as_ptr() as _,
@@ -393,7 +521,7 @@ pub fn color_message(message: &str, rgba: u32, callstack_depth: u16) {
 
 /// Set the current thread name to the provided value.
 pub fn set_thread_name(name: &str) {
-    #[cfg(feature="enable")]
+    #[cfg(feature = "enable")]
     unsafe {
         let name = CString::new(name).unwrap();
         // SAFE: `name` is a valid null-terminated string.
@@ -407,6 +535,7 @@ pub fn set_thread_name(name: &str) {
 ///
 /// ```
 /// # use tracy_client::*;
+/// enable();
 /// static TEMPERATURE: Plot = create_plot!("temperature");
 /// TEMPERATURE.point(37.0);
 /// ```
@@ -431,7 +560,7 @@ impl Plot {
 
     /// Add a point with `y`-axis value of `value` to the plot.
     pub fn point(&self, value: f64) {
-        #[cfg(feature="enable")]
+        #[cfg(feature = "enable")]
         unsafe {
             sys::___tracy_emit_plot(self.0.as_ptr() as _, value);
         }
@@ -456,11 +585,9 @@ const fn adjust_stack_depth(depth: u16) -> u16 {
 mod tests {
     use super::*;
 
-    #[global_allocator]
-    static GLOBAL: ProfiledAllocator<alloc::System> = ProfiledAllocator::new(alloc::System, 100);
-
     #[test]
     fn zone_values() {
+        enable();
         let span = Span::new("test zone values", "zone_values", file!(), line!(), 100);
         span.emit_value(42);
         span.emit_text("some text");
@@ -468,6 +595,7 @@ mod tests {
 
     #[test]
     fn finish_frameset() {
+        enable();
         for _ in 0..10 {
             finish_continuous_frame!();
         }
@@ -475,6 +603,7 @@ mod tests {
 
     #[test]
     fn finish_secondary_frameset() {
+        enable();
         for _ in 0..5 {
             finish_continuous_frame!("every two seconds");
         }
@@ -482,11 +611,13 @@ mod tests {
 
     #[test]
     fn non_continuous_frameset() {
+        enable();
         let _: Frame = start_noncontinuous_frame!("weird frameset");
     }
 
     #[test]
     fn plot_something() {
+        enable();
         static PLOT: Plot = create_plot!("a plot");
         for i in 0..10 {
             PLOT.point(i as f64);
@@ -495,6 +626,7 @@ mod tests {
 
     #[test]
     fn span_macro() {
+        enable();
         let span = span!("macro span", 42);
         span.emit_value(42);
         let span = span!("macro span");
