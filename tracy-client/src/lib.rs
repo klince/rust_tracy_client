@@ -386,7 +386,9 @@ impl Drop for Span {
 /// See documentation for [`std::alloc`](std::alloc) for more information about global allocators.
 ///
 /// Note that for this to work correctly, all allocations freed while the client is enabled must
-/// have a corresponding allocation in the same client instance.
+/// have a corresponding allocation in the same activation of the client. For all purposes and
+/// intends it is best to [`enable`] the client before any allocations and to avoid disabling the
+/// client.
 ///
 /// # Examples
 ///
