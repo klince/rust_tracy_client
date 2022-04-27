@@ -72,6 +72,20 @@ const STATE_DISABLING: usize = STATE_ENABLED + STATE_STEP;
 #[cfg(feature = "enable")]
 const STATE_MASK: usize = STATE_DISABLING;
 
+/// Enable the client.
+///
+/// The client must be enabled with this function before any instrumentation is invoked. This
+/// function can be called multiple times to increase the activation count even while the client
+/// already has been enabled.
+///
+/// # Example
+///
+/// ```rust
+/// fn main() {
+///     tracy_client::enable();
+///     // ...
+///     tracy_client::disable();
+/// }
 pub fn enable() {
     #[cfg(feature = "enable")]
     {
@@ -112,6 +126,35 @@ pub fn enable() {
     }
 }
 
+/// Disable the client.
+///
+/// This function will decrease the activation count and unload the client once this count reaches
+/// zero. Once the client has been disabled, no other calls to the instrumentation APIs may be
+/// made. Note that unloading the client will also discard any data collected up to that point.
+///
+/// When using threads, especially detached ones, consider either never calling `disable`, or at
+/// least use a `enable`-`disable` pair for each thread.
+///
+/// # Examples
+///
+/// ```rust
+/// fn main() {
+///     tracy_client::enable();
+///     // ...
+///     tracy_client::disable();
+/// }
+/// ```
+///
+/// One thing to watch out in particular is drop guards. For example the following code is invalid
+/// because a span guard is dropped after `disable` is called.
+///
+/// ```rust,no_run
+/// {
+///     tracy_client::enable();
+///     let _span = tracy_client::span!("some span");
+///     tracy_client::disable();
+/// } // `_span` is dropped here, after the client has been disabled!
+/// ```
 pub fn disable() {
     #[cfg(feature = "enable")]
     {
@@ -144,7 +187,7 @@ pub fn disable() {
     }
 }
 
-/// Start a new Tracy span with function, file, and line determined automatically.
+/// Start a new Tracy span with function, file, and line information determined automatically.
 ///
 /// # Examples
 ///
